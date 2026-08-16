@@ -16,10 +16,22 @@ most likely to go stale, because nothing auto-updates it.
 
 `@sntxrr/swamp-version/target`
 
-| Method  | Does                                                                        |
-| ------- | --------------------------------------------------------------------------- |
-| `sync`  | Record the version and platform a target reports about itself                |
-| `drift` | Compare that against the newest build published on a channel for its platform |
+| Method      | Does                                                                          |
+| ----------- | ----------------------------------------------------------------------------- |
+| `sync`      | Record the version and platform a target reports about itself                  |
+| `drift`     | Compare that against the newest build published on a channel for its platform  |
+| `repoDrift` | Compare the git checkout a `swamp serve` target serves against its branch      |
+
+### Two axes, and neither implies the other
+
+`drift` watches the **binary**. `repoDrift` watches the **checkout** a
+`swamp serve` install runs from. They move independently, and a green result on
+one says nothing about the other.
+
+The case this was written for: a container running the newest published binary
+— `drift` says `current`, every healthcheck green — while serving a checkout six
+commits behind `main`, because the serve entrypoint fetches at boot only and
+nothing had restarted it.
 
 ## Usage
 
@@ -32,6 +44,22 @@ swamp model create @sntxrr/swamp-version/target swamp-serve \
   --global-arg dockerContext=np-docker
 
 swamp model @sntxrr/swamp-version/target method run drift swamp-serve
+```
+
+The checkout that same container serves. `execEnv` is not optional decoration:
+an entrypoint that `export`s `GIT_SSH_COMMAND` sets it in-process, so
+`docker exec` gets a fresh process without it and the fetch fails
+`Permission denied (publickey)` while the deploy key is perfectly healthy.
+
+```bash
+swamp model create @sntxrr/swamp-version/target swamp-serve \
+  --global-arg probe=docker \
+  --global-arg container=swamp-serve \
+  --global-arg dockerContext=np-docker \
+  --global-arg repoDir=/data/repo \
+  --global-arg repoRef=main
+
+swamp model @sntxrr/swamp-version/target method run repoDrift swamp-serve
 ```
 
 The binary on this machine:
@@ -63,10 +91,22 @@ swamp model create @sntxrr/swamp-version/target buildbox \
 | `verifyArtifact`  | `true`                             | HEAD the resolved archive to confirm it is fetchable         |
 | `label`           | derived                            | Short stable name used in resource names                     |
 | `timeoutMs`       | `15000`                            | Per probe command and per HTTP call                          |
+| `repoDir`         | `/data/repo`                       | `repoDrift` only: the checkout inside the target             |
+| `repoRef`         | `main`                             | `repoDrift` only: branch the deployment tracks               |
+| `repoFetch`       | `true`                             | Fetch before comparing. Off compares against a frozen ref    |
+| `execEnv`         | —                                  | Env for probe commands, e.g. `GIT_SSH_COMMAND`               |
 
 ## The field to alert on
 
-`drift.behind`. Everything else is context:
+`drift.behind` for the binary, `repo.behind` for the checkout.
+
+`repo.behind` is deliberately true for both `behind` and `diverged`, so one
+predicate catches undeployed work either way — but read `status` before acting.
+`behind` is fixed by a restart; `diverged` means the checkout also carries local
+commits, and the restart that fixes `behind` does `reset --hard` and **destroys
+them**.
+
+Everything else is context:
 
 ```bash
 swamp data get drift-np-docker-swamp-serve --json | jq '{

@@ -18,6 +18,7 @@
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@1";
 import {
   artifactUrl,
+  classifyRepoDrift,
   compareVersions,
   deriveLabel,
   describeTarget,
@@ -25,9 +26,15 @@ import {
   formatVersion,
   hoursBetween,
   model,
+  parseCommitDate,
+  parseCount,
+  parseSha,
   parseSwampVersion,
   platformFromUname,
   platformPath,
+  redactEnvValues,
+  repoResourceName,
+  shellQuote,
   slug,
   stripAnsi,
   targetResourceName,
@@ -352,10 +359,179 @@ Deno.test("transportArgv builds the right command per probe", () => {
     ["docker", "exec", "swamp-serve", "uname", "-s"],
   );
 
+  // Each word is quoted individually rather than joined raw. A bare join is
+  // fine for `swamp --version` and wrong the moment an argument contains a
+  // space — `repoDir` is caller-supplied and goes straight into an ssh command
+  // line, so the quoting is what keeps a path like `/data/my repo` one word.
   assertEquals(
     transportArgv(args({ probe: "ssh", host: "docker" }), ["swamp", "--version"]),
-    ["ssh", "-o", "BatchMode=yes", "docker", "swamp --version"],
+    ["ssh", "-o", "BatchMode=yes", "docker", "'swamp' '--version'"],
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * Transport: environment injection
+ *
+ * The motivating bug: a container entrypoint that `export`s GIT_SSH_COMMAND
+ * sets it in-process, so `docker exec` starts a NEW process without it and
+ * git fetch fails `Permission denied (publickey)` while the deploy key is
+ * perfectly good. Reproducing the variable is the whole point of execEnv.
+ * ------------------------------------------------------------------ */
+
+Deno.test("transportArgv injects env as docker -e flags", () => {
+  assertEquals(
+    transportArgv(
+      args({ probe: "docker", container: "swamp-serve", dockerContext: "np-docker" }),
+      ["git", "fetch"],
+      { GIT_SSH_COMMAND: "ssh -i /k/id -o IdentitiesOnly=yes" },
+    ),
+    [
+      "docker",
+      "--context",
+      "np-docker",
+      "exec",
+      "-e",
+      "GIT_SSH_COMMAND=ssh -i /k/id -o IdentitiesOnly=yes",
+      "swamp-serve",
+      "git",
+      "fetch",
+    ],
+  );
+});
+
+Deno.test("transportArgv env survives ssh's extra round of shell parsing", () => {
+  const argv = transportArgv(
+    args({ probe: "ssh", host: "docker" }),
+    ["git", "fetch"],
+    { GIT_SSH_COMMAND: "ssh -i /k/id" },
+  );
+  // The whole remote command is one argv element, and the value keeps its
+  // spaces because it is quoted — unquoted, the remote shell would read `-i`
+  // as the start of the command.
+  assertEquals(argv.slice(0, 4), ["ssh", "-o", "BatchMode=yes", "docker"]);
+  assertEquals(argv[4], `GIT_SSH_COMMAND='ssh -i /k/id' 'git' 'fetch'`);
+});
+
+Deno.test("shellQuote survives an embedded single quote", () => {
+  // Close-escape-reopen. Getting this wrong ends the quoted string early and
+  // hands the remainder to the remote shell as code.
+  assertEquals(shellQuote("it's"), `'it'\\''s'`);
+  assertEquals(shellQuote("plain"), `'plain'`);
+});
+
+Deno.test("transportArgv adds nothing when env is absent or empty", () => {
+  const base = ["docker", "exec", "swamp-serve", "git", "status"];
+  assertEquals(
+    transportArgv(args({ probe: "docker", container: "swamp-serve" }), [
+      "git",
+      "status",
+    ]),
+    base,
+  );
+  assertEquals(
+    transportArgv(
+      args({ probe: "docker", container: "swamp-serve" }),
+      ["git", "status"],
+      {},
+    ),
+    base,
+  );
+});
+
+Deno.test("redactEnvValues masks env values, longest match first", () => {
+  assertEquals(
+    redactEnvValues(["docker", "exec", "-e", "TOKEN=abc123", "c", "git"], {
+      TOKEN: "abc123",
+    }),
+    "docker exec -e TOKEN=<TOKEN> c git",
+  );
+
+  // A short value that is a substring of a longer one must not be masked
+  // first, or the longer secret is left partially visible.
+  assertEquals(
+    redactEnvValues(["run", "abcdef"], { SHORT: "abc", LONG: "abcdef" }),
+    "run <LONG>",
+  );
+
+  // No env, and empty values, are no-ops rather than mangling the line.
+  assertEquals(redactEnvValues(["git", "fetch"]), "git fetch");
+  assertEquals(redactEnvValues(["git", "fetch"], { EMPTY: "" }), "git fetch");
+});
+
+/* ------------------------------------------------------------------ *
+ * repoDrift
+ * ------------------------------------------------------------------ */
+
+Deno.test("classifyRepoDrift separates diverged from behind", () => {
+  assertEquals(classifyRepoDrift(0, 0), "current");
+  assertEquals(classifyRepoDrift(6, 0), "behind");
+  assertEquals(classifyRepoDrift(0, 2), "ahead");
+  // Both sides have commits the other lacks. Kept distinct because the fix
+  // for `behind` — a restart, which does `reset --hard` — destroys the local
+  // commits here rather than deploying anything.
+  assertEquals(classifyRepoDrift(6, 2), "diverged");
+});
+
+Deno.test("parseCount refuses anything that is not a count", () => {
+  assertEquals(parseCount("6\n", "behind"), 6);
+  assertEquals(parseCount("0", "behind"), 0);
+  // The failure that matters: git printed a message, not a number. Returning
+  // 0 here would report "nothing to deploy" on a broken check.
+  assertThrows(() => parseCount("fatal: bad revision", "behind"), Error, "would be a guess");
+  assertThrows(() => parseCount("", "behind"), Error, "would be a guess");
+  assertThrows(() => parseCount("6 commits", "behind"), Error, "would be a guess");
+});
+
+Deno.test("parseSha accepts only a full 40-hex sha", () => {
+  assertEquals(
+    parseSha("47360651673C2166311CCC2FC645380FB2887866\n", "HEAD"),
+    "47360651673c2166311ccc2fc645380fb2887866",
+  );
+  // A short sha is rejected rather than padded or accepted: comparing a short
+  // sha against a full one would report drift that does not exist.
+  assertThrows(() => parseSha("4736065", "HEAD"), Error, "would be a guess");
+  assertThrows(() => parseSha("not-a-sha", "HEAD"), Error, "would be a guess");
+});
+
+Deno.test("parseCommitDate rejects unparseable dates", () => {
+  assertEquals(
+    parseCommitDate("2026-08-15T16:13:12-07:00", "HEAD").toISOString(),
+    "2026-08-15T23:13:12.000Z",
+  );
+  assertThrows(() => parseCommitDate("", "HEAD"), Error, "would be a guess");
+  assertThrows(() => parseCommitDate("yesterday", "HEAD"), Error, "would be a guess");
+});
+
+Deno.test("repoResourceName is spec-prefixed and distinct from the others", () => {
+  assertEquals(repoResourceName("serve"), "repo-serve");
+  assert(repoResourceName("serve") !== driftResourceName("serve"));
+  assert(repoResourceName("serve") !== targetResourceName("serve"));
+});
+
+Deno.test("the repo spec's schema accepts a realistic payload", () => {
+  // Guards the same way the other schema tests do: a field the schema does
+  // not allow must fail here, not at run time in a scheduled check.
+  const parsed = model.resources.repo.schema.parse({
+    label: "serve",
+    target: "docker://np-docker/swamp-serve",
+    repoDir: "/data/repo",
+    ref: "origin/main",
+    deployedSha: "187ed7af72ba9f625753bf0ab846e92052bc8ed1",
+    deployedShortSha: "187ed7a",
+    remoteSha: "47360651673c2166311ccc2fc645380fb2887866",
+    remoteShortSha: "4736065",
+    status: "behind",
+    behind: true,
+    commitsBehind: 6,
+    commitsAhead: 0,
+    hoursBehind: 46.8,
+    deployedCommittedAt: "2026-08-14T00:25:28.000Z",
+    remoteCommittedAt: "2026-08-15T23:13:12.000Z",
+    fetched: true,
+    checkedAt: "2026-08-15T23:30:00.000Z",
+  });
+  assertEquals(parsed.status, "behind");
+  assertEquals(parsed.commitsBehind, 6);
 });
 
 Deno.test("transportArgv refuses an incomplete probe", () => {

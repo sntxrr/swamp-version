@@ -2,10 +2,13 @@
  * Swamp version target — read the swamp version a host or container is running
  * and report how far it has drifted behind the published channel.
  *
- * Two read-only methods. `sync` records what a target reports about itself:
+ * Three read-only methods. `sync` records what a target reports about itself:
  * the swamp version it runs and the platform it runs on. `drift` resolves the
  * newest build published for that platform and reports whether the target is
- * behind it.
+ * behind it. `repoDrift` covers the second, independent axis — the git
+ * checkout a `swamp serve` target serves — because a container can run the
+ * newest binary while serving a checkout weeks behind its branch, and the
+ * binary check reports `current` throughout.
  *
  * This exists because swamp's own version is the one thing swamp had no model
  * for. `swamp update --check` answers the question for the binary invoking it,
@@ -84,6 +87,18 @@ const GlobalArgsSchema = z.object({
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Abort each probe command and each HTTP call after this long. A drift check must never hang a workflow.",
   ),
+  repoDir: z.string().default("/data/repo").describe(
+    "Path INSIDE the target to the git checkout `swamp serve` runs from. Only used by `repoDrift`.",
+  ),
+  repoRef: z.string().default("main").describe(
+    "Branch the deployment tracks. `repoDrift` compares the checkout against `origin/<repoRef>`.",
+  ),
+  repoFetch: z.boolean().default(true).describe(
+    "Run `git fetch` before comparing, so `origin/<repoRef>` reflects the real remote. Leaving this off compares against whatever the target last fetched — which is exactly the stale reading that makes a behind container look current. Turn it off only when the target has no network or no credential.",
+  ),
+  execEnv: z.record(z.string(), z.string()).optional().describe(
+    "Environment variables to set for probe commands. The motivating case is `GIT_SSH_COMMAND`: a container's entrypoint may export it in-process, in which case `docker exec` does NOT inherit it and git fetch fails `Permission denied (publickey)` even though the deploy key is fine. Set it here to reproduce the credential the target itself uses.",
+  ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -129,6 +144,52 @@ const DriftSchema = z.object({
   ),
   artifactVerified: z.boolean().describe(
     "Whether that URL was confirmed fetchable. False means verifyArtifact was off, not that the check failed — a failed check throws.",
+  ),
+  checkedAt: z.string(),
+});
+
+/**
+ * Repo-content drift: the OTHER axis on which a `swamp serve` install goes
+ * stale, and the one nothing else watches.
+ *
+ * A container can be running the newest published binary — `drift` says
+ * `current`, every healthcheck is green — while the git checkout it serves is
+ * weeks behind the branch it tracks, because the entrypoint fetches at boot
+ * only and nothing restarts it. The two axes move independently and neither
+ * implies the other.
+ */
+const RepoDriftSchema = z.object({
+  label: z.string(),
+  target: z.string(),
+  repoDir: z.string().describe(
+    "Checkout inspected, as a path inside the target",
+  ),
+  ref: z.string().describe("Remote branch compared against, e.g. origin/main"),
+  deployedSha: z.string().describe("Full commit the target currently serves"),
+  deployedShortSha: z.string(),
+  remoteSha: z.string().describe(
+    "Full commit at the tip of the tracked branch",
+  ),
+  remoteShortSha: z.string(),
+  status: z.enum(["current", "behind", "ahead", "diverged"]).describe(
+    "`ahead` means the checkout carries commits the branch does not — a hand-edit in the container, since a deployment artifact should never be ahead. `diverged` means both sides have commits the other lacks, which a `reset --hard` on the next boot will silently discard.",
+  ),
+  behind: z.boolean().describe(
+    "True when the tracked branch has commits the target has not deployed. The single field to alert on — true for `behind` AND `diverged`, because both mean undeployed work.",
+  ),
+  commitsBehind: z.number().describe(
+    "Exact commit count the target is missing. Unlike the binary axis this IS enumerable, because git has the list.",
+  ),
+  commitsAhead: z.number().describe(
+    "Commits present in the checkout but not on the branch. Non-zero means someone edited inside the target; a restart discards them.",
+  ),
+  hoursBehind: z.number().describe(
+    "Hours between the deployed commit and the branch tip, by committer date. Zero when not behind.",
+  ),
+  deployedCommittedAt: z.string(),
+  remoteCommittedAt: z.string(),
+  fetched: z.boolean().describe(
+    "Whether a fetch ran first. False means the comparison used the target's last-known remote state and may understate the drift.",
   ),
   checkedAt: z.string(),
 });
@@ -387,7 +448,10 @@ export function driftResourceName(label: string): string {
 export function transportArgv(
   globalArgs: GlobalArgs,
   cmd: string[],
+  env?: Record<string, string>,
 ): string[] {
+  const entries = Object.entries(env ?? {});
+
   switch (globalArgs.probe) {
     case "docker": {
       if (!globalArgs.container) {
@@ -398,7 +462,18 @@ export function transportArgv(
       const ctx = globalArgs.dockerContext
         ? ["--context", globalArgs.dockerContext]
         : [];
-      return ["docker", ...ctx, "exec", globalArgs.container, ...cmd];
+      // `-e K=V` rather than a shell prefix: docker exec takes argv directly,
+      // so there is no shell to quote for and no way for a value containing
+      // spaces (GIT_SSH_COMMAND always does) to be re-split.
+      const envArgs = entries.flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+      return [
+        "docker",
+        ...ctx,
+        "exec",
+        ...envArgs,
+        globalArgs.container,
+        ...cmd,
+      ];
     }
     case "ssh": {
       if (!globalArgs.host) {
@@ -406,6 +481,11 @@ export function transportArgv(
           "probe=ssh requires `host` — the SSH destination to run against.",
         );
       }
+      // ssh concatenates its command words and hands the result to a remote
+      // shell, so everything here must survive one round of shell parsing.
+      const prefix = entries
+        .map(([k, v]) => `${k}=${shellQuote(v)} `)
+        .join("");
       // BatchMode so an unattended run fails fast instead of blocking on a
       // password prompt that no scheduled job can ever answer.
       return [
@@ -413,12 +493,49 @@ export function transportArgv(
         "-o",
         "BatchMode=yes",
         globalArgs.host,
-        cmd.join(" "),
+        prefix + cmd.map(shellQuote).join(" "),
       ];
     }
     default:
+      // Local needs no wrapping; env is applied by the runtime instead.
       return cmd;
   }
+}
+
+/**
+ * Render argv for logs with any `execEnv` value replaced by its key.
+ *
+ * `execEnv` is where a credential would be passed — a `GIT_SSH_COMMAND` names
+ * a key file, and a future caller may well put something more sensitive there.
+ * Every place this module renders a command (log line, non-zero exit, timeout)
+ * goes through here, because the failure paths are exactly the ones that get
+ * pasted into an issue.
+ */
+export function redactEnvValues(
+  argv: string[],
+  env?: Record<string, string>,
+): string {
+  const values = Object.entries(env ?? {})
+    // Longest first, so a value that contains another is masked whole.
+    .sort((a, b) => b[1].length - a[1].length);
+
+  let line = argv.join(" ");
+  for (const [key, value] of values) {
+    if (value === "") continue;
+    line = line.replaceAll(value, `<${key}>`);
+  }
+  return line;
+}
+
+/**
+ * Single-quote a value for a POSIX shell.
+ *
+ * Only the `ssh` transport needs this — `docker exec` and a local spawn both
+ * take argv. Embedded single quotes are closed, escaped and reopened, which is
+ * the only form that is safe for arbitrary content.
+ */
+export function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
 /**
@@ -432,9 +549,15 @@ async function probe(
   globalArgs: GlobalArgs,
   cmd: string[],
   logger: Logger,
+  env?: Record<string, string>,
 ): Promise<string> {
-  const argv = transportArgv(globalArgs, cmd);
-  logger.info("Probing target with {argv}", { argv: argv.join(" ") });
+  const argv = transportArgv(globalArgs, cmd, env);
+  // Values are deliberately not logged: execEnv is the field a credential
+  // would be passed through, and a drift check must not be the thing that
+  // prints one into a scheduler's log.
+  logger.info("Probing target with {argv}", {
+    argv: redactEnvValues(argv, env),
+  });
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), globalArgs.timeoutMs);
@@ -445,6 +568,9 @@ async function probe(
       stdout: "piped",
       stderr: "piped",
       signal: controller.signal,
+      // Only meaningful for the local probe; the other transports carry env
+      // inside argv, where it is already applied.
+      ...(globalArgs.probe === "local" && env ? { env } : {}),
     });
     const output = await command.output();
     const decoder = new TextDecoder();
@@ -453,7 +579,7 @@ async function probe(
 
     if (output.code !== 0) {
       throw new Error(
-        `${argv.join(" ")} exited ${output.code}: ${
+        `${redactEnvValues(argv, env)} exited ${output.code}: ${
           summarise(stderr || stdout)
         }`,
       );
@@ -462,7 +588,9 @@ async function probe(
   } catch (cause) {
     if (controller.signal.aborted) {
       throw new Error(
-        `${argv.join(" ")} timed out after ${globalArgs.timeoutMs}ms`,
+        `${
+          redactEnvValues(argv, env)
+        } timed out after ${globalArgs.timeoutMs}ms`,
       );
     }
     if (cause instanceof Deno.errors.NotFound) {
@@ -647,6 +775,77 @@ async function verifyArtifactUrl(
  * ------------------------------------------------------------------ */
 
 /** Whole hours between two builds, rounded to one decimal, never negative. */
+/* ------------------------------------------------------------------ *
+ * Repo-content drift
+ * ------------------------------------------------------------------ */
+
+/** Resource name for the `repo` spec. Spec-prefixed — see above. */
+export function repoResourceName(label: string): string {
+  return `repo-${label}`;
+}
+
+/**
+ * Classify a checkout against the branch it tracks.
+ *
+ * `diverged` is kept distinct from `behind` rather than folded into it because
+ * the two want different responses: behind is fixed by a restart, diverged
+ * means a restart *destroys* work, since the entrypoint does `reset --hard`.
+ * Both set `behind: true` — both describe undeployed commits on the branch —
+ * so a single alert predicate still catches either.
+ */
+export function classifyRepoDrift(
+  commitsBehind: number,
+  commitsAhead: number,
+): "current" | "behind" | "ahead" | "diverged" {
+  if (commitsBehind > 0 && commitsAhead > 0) return "diverged";
+  if (commitsBehind > 0) return "behind";
+  if (commitsAhead > 0) return "ahead";
+  return "current";
+}
+
+/**
+ * Parse a count printed by `git rev-list --count`.
+ *
+ * Throws rather than defaulting to 0: a count that could not be read is not a
+ * count of zero, and zero is the answer that says "nothing to do".
+ */
+export function parseCount(raw: string, what: string): number {
+  const trimmed = stripAnsi(raw).trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(
+      `Expected a commit count for ${what}, got: ${summarise(raw)}. ` +
+        `Refusing to report a drift status that would be a guess.`,
+    );
+  }
+  return parseInt(trimmed, 10);
+}
+
+/** Validate and normalise a full commit sha printed by `git rev-parse`. */
+export function parseSha(raw: string, what: string): string {
+  const trimmed = stripAnsi(raw).trim();
+  if (!/^[0-9a-f]{40}$/i.test(trimmed)) {
+    throw new Error(
+      `Expected a commit sha for ${what}, got: ${summarise(raw)}. ` +
+        `Refusing to report a drift status that would be a guess.`,
+    );
+  }
+  return trimmed.toLowerCase();
+}
+
+/** Parse a committer date printed by `git log -1 --format=%cI`. */
+export function parseCommitDate(raw: string, what: string): Date {
+  const trimmed = stripAnsi(raw).trim();
+  const parsed = new Date(trimmed);
+  if (trimmed === "" || Number.isNaN(parsed.getTime())) {
+    throw new Error(
+      `Expected an ISO 8601 committer date for ${what}, got: ${
+        summarise(raw)
+      }. Refusing to report a drift status that would be a guess.`,
+    );
+  }
+  return parsed;
+}
+
 export function hoursBetween(older: Date, newer: Date): number {
   const ms = newer.getTime() - older.getTime();
   if (ms <= 0) return 0;
@@ -665,6 +864,9 @@ export function hoursBetween(older: Date, newer: Date): number {
  *   --global-arg dockerContext=np-docker
  * swamp model @sntxrr/swamp-version/target method run drift swamp-serve
  *
+ * # the checkout that container serves, against the branch it tracks
+ * swamp model @sntxrr/swamp-version/target method run repoDrift swamp-serve
+ *
  * # the binary on this machine
  * swamp model create @sntxrr/swamp-version/target laptop --global-arg probe=local
  * swamp model @sntxrr/swamp-version/target method run drift laptop
@@ -673,8 +875,8 @@ export function hoursBetween(older: Date, newer: Date): number {
 export const model = {
   type: "@sntxrr/swamp-version/target",
   description:
-    "Read the swamp version a host or container runs and report how far it has drifted behind the published channel. Read-only — it never updates anything.",
-  version: "2026.08.08.1",
+    "Read the swamp version a host or container runs, and the git checkout it serves, and report how far each has drifted. Read-only — it never updates anything.",
+  version: "2026.08.15.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     target: {
@@ -688,6 +890,13 @@ export const model = {
       description:
         "Comparison of the target's version against the newest build published for its platform.",
       schema: DriftSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
+    repo: {
+      description:
+        "Comparison of the git checkout the target serves against the branch it tracks.",
+      schema: RepoDriftSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
     },
@@ -816,6 +1025,124 @@ export const model = {
             latestBuiltAt: latestBuiltAt.toISOString(),
             artifactUrl: url,
             artifactVerified: globalArgs.verifyArtifact,
+            checkedAt: new Date().toISOString(),
+          },
+        );
+
+        return { dataHandles: [handle] };
+      },
+    },
+
+    repoDrift: {
+      description:
+        "Compare the git checkout the target serves against the branch it tracks, and report how many commits it has not deployed. Read-only with respect to the working tree: it fetches and reads refs, and never checks anything out.",
+      arguments: z.object({}),
+      execute: async (_args: Record<never, never>, context: Context) => {
+        const { globalArgs, logger } = context;
+        const label = deriveLabel(globalArgs);
+        const target = describeTarget(globalArgs);
+        const { repoDir, repoRef, execEnv } = globalArgs;
+        const remoteRef = `origin/${repoRef}`;
+
+        const git = (...args: string[]) =>
+          probe(globalArgs, ["git", "-C", repoDir, ...args], logger, execEnv);
+
+        // Fetch first, or the comparison is against whatever the target last
+        // saw. That is not a hypothetical: an entrypoint that fetches only at
+        // boot leaves `origin/<ref>` frozen at the boot-time tip, so a stale
+        // container reports itself current with complete confidence.
+        if (globalArgs.repoFetch) {
+          await git("fetch", "--quiet", "origin", repoRef);
+        } else {
+          logger.warn(
+            "repoFetch is off — comparing {target} against its last-known {remoteRef}, which may understate the drift",
+            { target, remoteRef },
+          );
+        }
+
+        const deployedSha = parseSha(await git("rev-parse", "HEAD"), "HEAD");
+        const remoteSha = parseSha(
+          await git("rev-parse", remoteRef),
+          remoteRef,
+        );
+
+        const commitsBehind = parseCount(
+          await git("rev-list", "--count", `HEAD..${remoteRef}`),
+          `commits behind ${remoteRef}`,
+        );
+        const commitsAhead = parseCount(
+          await git("rev-list", "--count", `${remoteRef}..HEAD`),
+          `commits ahead of ${remoteRef}`,
+        );
+
+        const deployedAt = parseCommitDate(
+          await git("log", "-1", "--format=%cI", deployedSha),
+          "the deployed commit",
+        );
+        const remoteAt = parseCommitDate(
+          await git("log", "-1", "--format=%cI", remoteSha),
+          `the tip of ${remoteRef}`,
+        );
+
+        const status = classifyRepoDrift(commitsBehind, commitsAhead);
+
+        if (status === "behind") {
+          logger.warn(
+            "{target} serves {deployed}, {count} commits behind {remoteRef} ({remote})",
+            {
+              target,
+              deployed: deployedSha.slice(0, 7),
+              count: commitsBehind,
+              remoteRef,
+              remote: remoteSha.slice(0, 7),
+            },
+          );
+        } else if (status === "diverged") {
+          // Worth its own line: the fix for `behind` actively destroys data here.
+          logger.warn(
+            "{target} has DIVERGED from {remoteRef}: {behind} behind, {ahead} ahead. A restart does `reset --hard` and will discard the {ahead} local commit(s).",
+            {
+              target,
+              remoteRef,
+              behind: commitsBehind,
+              ahead: commitsAhead,
+            },
+          );
+        } else if (status === "ahead") {
+          logger.warn(
+            "{target} is {ahead} commit(s) ahead of {remoteRef} — a deployment checkout should never be ahead, so something was edited in place.",
+            { target, ahead: commitsAhead, remoteRef },
+          );
+        } else {
+          logger.info("{target} serves {deployed}, current with {remoteRef}", {
+            target,
+            deployed: deployedSha.slice(0, 7),
+            remoteRef,
+          });
+        }
+
+        const handle = await context.writeResource(
+          "repo",
+          repoResourceName(label),
+          {
+            label,
+            target,
+            repoDir,
+            ref: remoteRef,
+            deployedSha,
+            deployedShortSha: deployedSha.slice(0, 7),
+            remoteSha,
+            remoteShortSha: remoteSha.slice(0, 7),
+            status,
+            behind: commitsBehind > 0,
+            commitsBehind,
+            commitsAhead,
+            hoursBehind: commitsBehind > 0
+              ? hoursBetween(deployedAt, remoteAt)
+              : 0,
+            deployedCommittedAt: deployedAt.toISOString(),
+            remoteCommittedAt: remoteAt.toISOString(),
+            fetched: globalArgs.repoFetch,
             checkedAt: new Date().toISOString(),
           },
         );
