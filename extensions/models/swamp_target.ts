@@ -186,6 +186,9 @@ const RepoDriftSchema = z.object({
   hoursBehind: z.number().describe(
     "Hours between the deployed commit and the branch tip, by committer date. Zero when not behind.",
   ),
+  staleHours: z.number().describe(
+    "Hours the branch tip has been sitting UNDEPLOYED — now minus its committer date. Distinct from hoursBehind, which measures the gap between two commits and says nothing about when. This is the field to alert on where a deploy pipeline is supposed to close the gap on its own: any drift younger than that pipeline's cycle is normal and about to fix itself, while drift older than it means the pipeline is not running. Zero when not behind.",
+  ),
   deployedCommittedAt: z.string(),
   remoteCommittedAt: z.string(),
   fetched: z.boolean().describe(
@@ -1139,6 +1142,9 @@ export const model = {
             commitsAhead,
             hoursBehind: commitsBehind > 0
               ? hoursBetween(deployedAt, remoteAt)
+              : 0,
+            staleHours: commitsBehind > 0
+              ? hoursBetween(remoteAt, new Date())
               : 0,
             deployedCommittedAt: deployedAt.toISOString(),
             remoteCommittedAt: remoteAt.toISOString(),

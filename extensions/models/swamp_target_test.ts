@@ -525,6 +525,7 @@ Deno.test("the repo spec's schema accepts a realistic payload", () => {
     commitsBehind: 6,
     commitsAhead: 0,
     hoursBehind: 46.8,
+    staleHours: 3.2,
     deployedCommittedAt: "2026-08-14T00:25:28.000Z",
     remoteCommittedAt: "2026-08-15T23:13:12.000Z",
     fetched: true,
